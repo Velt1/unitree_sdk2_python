@@ -12,7 +12,8 @@ Python interface for unitree sdk2
 ```bash
 pip install unitree_sdk2py
 ```
-
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip
 ### Installing from source
 Execute the following commands in the terminal:
 ```bash
