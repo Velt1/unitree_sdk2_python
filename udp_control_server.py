@@ -23,7 +23,8 @@ from typing import Callable, Any, Dict
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.go2.sport.sport_client import SportClient
-
+from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient
+from unitree_sdk2py.go2.robot_state.robot_state_client import RobotStateClient
 
 
 # --------------------------------------------------------------------------- #
@@ -59,6 +60,7 @@ def _noop(cli: SportClient, _):             # nur als Platzhalter
     pass
 
 CMD_MAP: Dict[str, Cmd] = {
+    "hb"            : Cmd(lambda s, _: None),   # Health-Check, keine Aktion
     "damp"          : Cmd(lambda s, _: s.Damp()),
     "stand_up"      : Cmd(lambda s, _: s.StandUp()),
     "stand_down"    : Cmd(lambda s, _: s.StandDown()),
@@ -85,11 +87,16 @@ CMD_MAP: Dict[str, Cmd] = {
 # --------------------------------------------------------------------------- #
 
 class UDPCommandProtocol(asyncio.DatagramProtocol):
-    def __init__(self, sport: SportClient) -> None:
+    def __init__(self, sport: SportClient, oa: ObstaclesAvoidClient) -> None:
         self.sport            = sport
+        self.obstacles_avoid  = oa
         self.last_seq_by_peer: Dict[tuple[str, int], int] = {}
         self.last_ts_by_peer:  Dict[tuple[str, int], int] = {}
         self.last_cmd_ts: float = time.monotonic()
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport):
+        self.transport = transport
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~ Datagram-Callback ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
     def datagram_received(self, data: bytes, addr):
@@ -109,9 +116,16 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
         if not self._auth_ok(msg):
             log.warning("Auth failed from %s", addr)
             return
-        if abs(now - msg["ts"] / 1e9) > CLOCK_DRIFT_S:
-            log.warning("Stale packet from %s (ts=%s)", addr, msg["ts"])
+
+        try:
+            ts_ns = int(msg.get("ts", 0))
+        except (TypeError, ValueError):
+            log.warning("Bad ts from %s", addr)
             return
+
+        if abs(now - ts_ns / 1e9) > CLOCK_DRIFT_S:
+            log.warning("Stale packet from %s (ts=%s)", addr, ts_ns)
+            return 
         
         # --------- Replay- und Neustart-Erkennung -------------------------- #
         peer = addr                                   # (ip, port)
@@ -132,22 +146,48 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
 
         # --------- Befehl ausführen --------------------------------------- #
         cmd_name = msg.get("cmd")
-        cmd = CMD_MAP.get(cmd_name)
-        if not cmd:
-            log.warning("Unknown cmd '%s' from %s", cmd_name, addr)
-            return
         args = msg.get("args") or {}
-        if cmd.need_arg and not args:
-            log.warning("Cmd '%s' requires args – ignored", cmd_name)
-            return
+        print(args)
+         # --------- MOVE → ObstaclesAvoid -------------------------------- #
+        if cmd_name == "oa.move":
+            vx = float(args.get("vx", 0))
+            vy = float(args.get("vy", 0))
+            w  = float(args.get("w" , 0))
+            try:
+                self.obstacles_avoid.Move(vx, vy, w)
+                log.info("OA.Move  vx=%g vy=%g w=%g", vx, vy, w)
+            except Exception as e:
+                log.exception("OA.Move error: %s", e)
+        else:
+            cmd = CMD_MAP.get(cmd_name)
+            if not cmd:
+                log.warning("Unknown cmd '%s' from %s", cmd_name, addr)
+                return
+            if cmd.need_arg and not args:
+                log.warning("Cmd '%s' requires args – ignored", cmd_name)
+                return
+            try:
+                cmd.fn(self.sport, args)
+                log.info("Executed %s args=%s", cmd_name, args)
+            except Exception as e:
+                log.exception("SportClient error on %s: %s", cmd_name, e)
 
-        try:
-            cmd.fn(self.sport, args)
-            log.info("Executed %s args=%s", cmd_name, args)
-        except Exception as e:
-            log.exception("SportClient error on %s: %s", cmd_name, e)
 
         self.last_cmd_ts = time.monotonic()
+        
+           # ------------ Echo zurück  (loss & rtt optional) -------------- #
+        try:
+            # primitive Loss-Schätzung: 1 wenn seq-Sprung >1
+            last_seen = self.last_seq_by_peer.get(peer, None)
+            lost = max(0, msg["seq"] - 1 - last_seen) if last_seen is not None else 0
+            loss_pct = 100 if msg["seq"]==0 else int(100 * lost / max(1, msg["seq"]))
+
+            rtt_ms = max(0, int((time.time() - ts_ns / 1e9) * 1000))
+
+            echo = {"ack": msg.get("seq"), "loss": loss_pct, "rtt": rtt_ms}
+            self.transport.sendto(json.dumps(echo).encode(), addr)
+        except Exception:
+            pass
 
     # ------------------------------- Helpers ------------------------------- #
     def _auth_ok(self, msg: dict) -> bool:
@@ -189,10 +229,26 @@ async def main():
     sport.SetTimeout(10.0)
     sport.Init()
     log.info("SportClient initialised")
+    oa = ObstaclesAvoidClient()
+    oa.Init()
+    oa.SwitchSet(True)
+    oa.UseRemoteCommandFromApi(True)
+    log.info("ObstaclesAvoidClient initialised")
+    # state = RobotStateClient()
+    # state.Init()
+    # state.SetReportFreq(1000, 10000)
+    # code, services = state.ServiceList()
+    # if code == 0:
+    #     for svc in services:
+    #         log.info("Srv %-18s status=%d protect=%s",
+    #                 svc.name, svc.status, svc.protect)
+    # else:
+    #     log.error("ServiceList failed (%d)", code)
+    # log.info("RobotStateClient initialised")
 
     loop = asyncio.get_running_loop()
     transport, proto = await loop.create_datagram_endpoint(
-        lambda: UDPCommandProtocol(sport),
+        lambda: UDPCommandProtocol(sport, oa),
         local_addr=(LISTEN_IP, port),
         reuse_port=True,
     )

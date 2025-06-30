@@ -45,7 +45,7 @@ class RobotStateClient(Client):
             s = ServiceState()
             s.name = t["name"]
             s.status = t["status"]
-            s.protect = t["protect"]
+            s.protect = t["protect"] 
             lst.append(s)
             
         return code, lst
