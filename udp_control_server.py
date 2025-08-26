@@ -43,7 +43,9 @@ CLOCK_DRIFT_S  = 2.0             # ältere Pakete ⇒ Drop (Replay-Schutz)
 WATCHDOG_MS    = 300             # Roboter stoppt nach 300 ms Funkstille
 LOG_LEVEL      = logging.INFO
 # Vorsicht: Base64 vergrößert um ~33%. Wir halten Chunk klein, damit Header + JSON passen.
-IMAGE_B64_CHUNK = 300
+IMAGE_B64_CHUNK = 900
+SEND_CHUNK_DELAY_S   = 0.0005   # 0.5 ms pacing between UDP packets
+SEND_CHUNK_BATCH     = 25       # small yield every N packets
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -153,6 +155,7 @@ class LowStateMonitor:
                 return any(k == p or k.startswith(p) for p in include)
 
             return {k: v for k, v in flat.items() if keep(k)}
+        
 
 # --------------------------------------------------------------------------- #
 #                               Sport-Befehle                                 #
@@ -219,6 +222,12 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
         self.video = video
     def connection_made(self, transport):
         self.transport = transport
+        try:
+            sock = transport.get_extra_info("socket")
+            import socket as pysock
+            sock.setsockopt(pysock.SOL_SOCKET, pysock.SO_SNDBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~ Datagram-Callback ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
     def datagram_received(self, data: bytes, addr):
@@ -313,51 +322,20 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
             try:
                 ret, bin_data = self.video.GetImageSample()
                 if ret != 0 or not bin_data:
-                    self.transport.sendto(
-                        json.dumps({"err": "no-image", "code": ret}, separators=(",", ":"), ensure_ascii=False).encode(),
-                        addr
-                    )
+                    self.transport.sendto(json.dumps({"err":"no-image","code":ret},separators=(",",":"),ensure_ascii=False).encode(), addr)
                     return
-                # bin_data kann je nach Binding bytes/bytearray/list[int]/tuple[int] sein → in bytes umwandeln
+
                 if isinstance(bin_data, (bytes, bytearray)):
                     raw = bytes(bin_data)
                 elif isinstance(bin_data, (list, tuple)):
-                    try:
-                        raw = bytes(bin_data)
-                    except Exception:
-                        self.transport.sendto(
-                            json.dumps({"err": "bad-image-type"}, separators=(",", ":"), ensure_ascii=False).encode(),
-                            addr
-                        )
-                        return
+                    raw = bytes(bin_data)
                 else:
-                    try:
-                        raw = memoryview(bin_data).tobytes()
-                    except Exception:
-                        self.transport.sendto(
-                            json.dumps({"err": "bad-image-type"}, separators=(",", ":"), ensure_ascii=False).encode(),
-                            addr
-                        )
-                        return
-                # base64 encodieren und in UDP-taugliche JSON-Chunks zerlegen
-                b64 = base64.b64encode(raw).decode("ascii")
-                total_chunks = max(1, math.ceil(len(b64) / IMAGE_B64_CHUNK))
-                img_id = int(time.time() * 1e6)  # einfache ID
-                # Header schicken
-                header = {"img": {"id": img_id, "n": total_chunks, "size": len(raw)}}
-                self.transport.sendto(
-                    json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode(),
-                    addr
-                )
-                # Daten-Chunks schicken
-                for idx in range(total_chunks):
-                    piece = b64[idx * IMAGE_B64_CHUNK:(idx + 1) * IMAGE_B64_CHUNK]
-                    pkt = {"img": {"id": img_id, "i": idx, "n": total_chunks, "data": piece}}
-                    self.transport.sendto(
-                        json.dumps(pkt, separators=(",", ":"), ensure_ascii=False).encode(),
-                        addr
-                    )
-                log.info("Sent image id=%s in %d chunk(s), %d bytes raw", img_id, total_chunks, len(raw))
+                    raw = memoryview(bin_data).tobytes()
+
+                img_id = int(time.time()*1e6)
+                # fire-and-forget async sender with pacing
+                asyncio.create_task(self._send_image_paced(addr, img_id, raw))
+                log.info("Queued image id=%s (%d bytes) for paced send", img_id, len(raw))
             except Exception as e:
                 log.exception("GetImageSample error: %s", e)
             return
@@ -411,6 +389,32 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
                 except Exception:
                     log.exception("Watchdog StopMove failed")
                 self.last_cmd_ts = time.monotonic()  # verhindert Dauerschleife
+    
+        # helper: async image sender with pacing
+    async def _send_image_paced(self, addr, img_id: int, raw: bytes):
+        import math, json, base64, asyncio
+        b64 = base64.b64encode(raw).decode("ascii")
+        total_chunks = max(1, math.ceil(len(b64) / IMAGE_B64_CHUNK))
+
+        # send header (send twice for robustness)
+        header = {"img": {"id": img_id, "n": total_chunks, "size": len(raw)}}
+        pkt = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+        self.transport.sendto(pkt, addr)
+        self.transport.sendto(pkt, addr)
+
+        # data chunks with light pacing
+        for idx in range(total_chunks):
+            piece = b64[idx*IMAGE_B64_CHUNK:(idx+1)*IMAGE_B64_CHUNK]
+            msg = {"img": {"id": img_id, "i": idx, "n": total_chunks, "data": piece}}
+            self.transport.sendto(json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode(), addr)
+
+            # yield every packet a tiny bit, and a tad more every batch
+            if SEND_CHUNK_DELAY_S > 0:
+                await asyncio.sleep(SEND_CHUNK_DELAY_S)
+            if SEND_CHUNK_BATCH and (idx + 1) % SEND_CHUNK_BATCH == 0:
+                await asyncio.sleep(SEND_CHUNK_DELAY_S * 2)
+
+
 
 
 # --------------------------------------------------------------------------- #
