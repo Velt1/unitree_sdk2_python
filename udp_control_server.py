@@ -17,7 +17,7 @@ Verlorene Pakete sind unkritisch; kommen > WATCHDOG_MS keine neuen,
 stoppt der Roboter failsafe (StopMove).
 """
 from __future__ import annotations
-import asyncio, json, math, sys, time, hmac, hashlib, logging, threading, subprocess, os
+import asyncio, json, math, sys, time, hmac, hashlib, logging, threading, subprocess, os, base64
 from datetime import datetime
 from dataclasses import asdict, is_dataclass, dataclass
 from numbers import Real
@@ -29,7 +29,7 @@ from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 from unitree_sdk2py.core.channel import ChannelSubscriber
-
+from unitree_sdk2py.go2.video.video_client import VideoClient
 
 # --------------------------------------------------------------------------- #
 #                         ► Konfiguration & Konstanten                        #
@@ -42,6 +42,8 @@ TOKEN          = b"CHANGE_ME"    # PSK – mind. 16 random Bytes!
 CLOCK_DRIFT_S  = 2.0             # ältere Pakete ⇒ Drop (Replay-Schutz)
 WATCHDOG_MS    = 300             # Roboter stoppt nach 300 ms Funkstille
 LOG_LEVEL      = logging.INFO
+# Vorsicht: Base64 vergrößert um ~33%. Wir halten Chunk klein, damit Header + JSON passen.
+IMAGE_B64_CHUNK = 300
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -205,7 +207,7 @@ CMD_MAP: Dict[str, Cmd] = {
 # --------------------------------------------------------------------------- #
 
 class UDPCommandProtocol(asyncio.DatagramProtocol):
-    def __init__(self, sport: SportClient, oa: ObstaclesAvoidClient, lowstate: LowStateMonitor) -> None:
+    def __init__(self, sport: SportClient, oa: ObstaclesAvoidClient, lowstate: LowStateMonitor, video: VideoClient) -> None:
         self.sport            = sport
         self.obstacles_avoid  = oa
         self.last_seq_by_peer: Dict[tuple[str, int], int] = {}
@@ -214,6 +216,7 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
         self.transport: asyncio.DatagramTransport | None = None
         self.lowstate = lowstate
         self.log_subs: set[tuple[str, int]] = set()
+        self.video = video
     def connection_made(self, transport):
         self.transport = transport
 
@@ -306,6 +309,58 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
                 addr
             )
             return
+        elif cmd_name == "get_image":
+            try:
+                ret, bin_data = self.video.GetImageSample()
+                if ret != 0 or not bin_data:
+                    self.transport.sendto(
+                        json.dumps({"err": "no-image", "code": ret}, separators=(",", ":"), ensure_ascii=False).encode(),
+                        addr
+                    )
+                    return
+                # bin_data kann je nach Binding bytes/bytearray/list[int]/tuple[int] sein → in bytes umwandeln
+                if isinstance(bin_data, (bytes, bytearray)):
+                    raw = bytes(bin_data)
+                elif isinstance(bin_data, (list, tuple)):
+                    try:
+                        raw = bytes(bin_data)
+                    except Exception:
+                        self.transport.sendto(
+                            json.dumps({"err": "bad-image-type"}, separators=(",", ":"), ensure_ascii=False).encode(),
+                            addr
+                        )
+                        return
+                else:
+                    try:
+                        raw = memoryview(bin_data).tobytes()
+                    except Exception:
+                        self.transport.sendto(
+                            json.dumps({"err": "bad-image-type"}, separators=(",", ":"), ensure_ascii=False).encode(),
+                            addr
+                        )
+                        return
+                # base64 encodieren und in UDP-taugliche JSON-Chunks zerlegen
+                b64 = base64.b64encode(raw).decode("ascii")
+                total_chunks = max(1, math.ceil(len(b64) / IMAGE_B64_CHUNK))
+                img_id = int(time.time() * 1e6)  # einfache ID
+                # Header schicken
+                header = {"img": {"id": img_id, "n": total_chunks, "size": len(raw)}}
+                self.transport.sendto(
+                    json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode(),
+                    addr
+                )
+                # Daten-Chunks schicken
+                for idx in range(total_chunks):
+                    piece = b64[idx * IMAGE_B64_CHUNK:(idx + 1) * IMAGE_B64_CHUNK]
+                    pkt = {"img": {"id": img_id, "i": idx, "n": total_chunks, "data": piece}}
+                    self.transport.sendto(
+                        json.dumps(pkt, separators=(",", ":"), ensure_ascii=False).encode(),
+                        addr
+                    )
+                log.info("Sent image id=%s in %d chunk(s), %d bytes raw", img_id, total_chunks, len(raw))
+            except Exception as e:
+                log.exception("GetImageSample error: %s", e)
+            return
         else:
             cmd = CMD_MAP.get(cmd_name)
             if not cmd:
@@ -385,10 +440,13 @@ async def main():
     log.info("ObstaclesAvoidClient initialised")
     lowstate = LowStateMonitor()
     log.info("LowStateMonitor initialised")
-    
+    video = VideoClient()
+    video.SetTimeout(20.0)
+    video.Init()
+    log.info("VideoClient initialised")
     loop = asyncio.get_running_loop()
     transport, proto = await loop.create_datagram_endpoint(
-        lambda: UDPCommandProtocol(sport, oa, lowstate),
+        lambda: UDPCommandProtocol(sport, oa, lowstate, video),
         local_addr=(LISTEN_IP, port),
         reuse_port=True,
     )       
