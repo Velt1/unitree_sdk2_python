@@ -17,14 +17,18 @@ Verlorene Pakete sind unkritisch; kommen > WATCHDOG_MS keine neuen,
 stoppt der Roboter failsafe (StopMove).
 """
 from __future__ import annotations
-import asyncio, json, math, sys, time, hmac, hashlib, logging
-from dataclasses import dataclass
+import asyncio, json, math, sys, time, hmac, hashlib, logging, threading, subprocess, os
+from datetime import datetime
+from dataclasses import asdict, is_dataclass, dataclass
+from numbers import Real
+from collections.abc import Mapping, Sequence
 from typing import Callable, Any, Dict
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient
-from unitree_sdk2py.go2.robot_state.robot_state_client import RobotStateClient
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
+from unitree_sdk2py.core.channel import ChannelSubscriber
 
 
 # --------------------------------------------------------------------------- #
@@ -45,6 +49,108 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("udp_control")
+
+
+# ----------------------- UDP‑Log‑Handler (Server → Clients) ---------------
+class UDPLogHandler(logging.Handler):
+    """Schickt jeden Log‑Record als JSON an alle abonnierten Peers."""
+    def __init__(self, proto: "UDPCommandProtocol"):
+        super().__init__()
+        self.proto = proto
+        self.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d  %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+
+    def emit(self, record: logging.LogRecord):
+        if not self.proto.transport:
+            return
+        msg_txt = self.format(record)
+        pkt = json.dumps({
+            "log":   msg_txt,
+            "level": record.levelname,
+            "ts":    int(record.created * 1e9),  # ns
+        }).encode()
+        for peer in list(self.proto.log_subs):
+            try:
+                self.proto.transport.sendto(pkt, peer)
+            except (OSError, AttributeError):
+                self.proto.log_subs.discard(peer)
+
+# --------------------------------------------------------------------------- #
+#                             Low-State Subscription                           #
+# --------------------------------------------------------------------------- #
+class LowStateMonitor:
+    
+    ROUND_NDIGITS = 3 
+    """Thread-safe Aufbewahrung des letzten LowState-Samples."""
+    def __init__(self) -> None:
+        self._latest: LowState_ | None = None
+        self._lock   = threading.Lock()
+
+        # DDS-Subscriber starten (separater Thread in der RT-Mittelware)
+        self._sub = ChannelSubscriber("rt/lowstate", LowState_)
+        # QoS depth = 1 reicht: wir wollen nur das jüngste Sample
+        self._sub.Init(self._handler, 1)
+
+    # DDS-Callback (läuft NICHT im asyncio-Thread!)
+    def _handler(self, msg: LowState_):
+        with self._lock:
+            self._latest = msg
+
+    def _round(self, val):
+            return round(val, self.ROUND_NDIGITS) if isinstance(val, Real) and not isinstance(val, bool) else val
+        
+    def _jsonable(self, val):
+        """bytes → Liste[int]; alles andere unverändert zurückgeben."""
+        if isinstance(val, (bytes, bytearray)):
+            return list(val)
+        return val
+
+    def _flatten(self, obj, prefix=""):
+        flat = {}
+
+        # Dataclass → dict
+        if is_dataclass(obj):
+            obj = asdict(obj)
+
+        # Mapping
+        if isinstance(obj, Mapping):
+            for k, v in obj.items():
+                flat.update(self._flatten(v, f"{prefix}{k}_"))
+
+        # Sequenz (aber kein str/bytes)
+        elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+            for idx, v in enumerate(obj):
+                flat.update(self._flatten(v, f"{prefix}{idx}_"))
+
+        # Skalar
+        else:
+            flat[prefix[:-1]] = self._round(self._jsonable(obj))
+
+        return flat
+
+    # ------------------------------- API ----------------------------------- #
+    def snapshot(self, include: set[str] | None = None) -> dict | None:
+        """
+        Liefert ein flaches JSON-Dict.
+        Falls *include* gesetzt ist, bleiben nur Keys erhalten, die
+        (1) exakt in include stehen  oder
+        (2) mit einem der Einträge beginnen.
+        """
+        with self._lock:
+            if not self._latest:
+                return None
+
+            flat = self._flatten(self._latest)
+
+            if not include:                 # kein Filter ⇒ alles schicken
+                return flat
+
+            def keep(k: str) -> bool:
+                return any(k == p or k.startswith(p) for p in include)
+
+            return {k: v for k, v in flat.items() if keep(k)}
 
 # --------------------------------------------------------------------------- #
 #                               Sport-Befehle                                 #
@@ -79,6 +185,18 @@ CMD_MAP: Dict[str, Cmd] = {
         ),
         need_arg=True,
     ),
+    # --- System‑Befehle --------------------------------------------------
+    # Reboot des gesamten Hosts.  **Vorsicht:** stoppt laufende Prozesse!
+    "reboot"        : Cmd(
+        lambda _s, _a: subprocess.Popen(
+            ["systemctl", "reboot", "--no-wall"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    ),
+    # --- Logging‑Subscription ----------------------------------------
+    "log_sub"       : Cmd(lambda _s, _a: None),   # handled inline
+    "log_unsub"     : Cmd(lambda _s, _a: None),   # handled inline
     # weitere Befehle lassen sich hier einzeilig ergänzen …
 }
 
@@ -87,14 +205,15 @@ CMD_MAP: Dict[str, Cmd] = {
 # --------------------------------------------------------------------------- #
 
 class UDPCommandProtocol(asyncio.DatagramProtocol):
-    def __init__(self, sport: SportClient, oa: ObstaclesAvoidClient) -> None:
+    def __init__(self, sport: SportClient, oa: ObstaclesAvoidClient, lowstate: LowStateMonitor) -> None:
         self.sport            = sport
         self.obstacles_avoid  = oa
         self.last_seq_by_peer: Dict[tuple[str, int], int] = {}
         self.last_ts_by_peer:  Dict[tuple[str, int], int] = {}
         self.last_cmd_ts: float = time.monotonic()
         self.transport: asyncio.DatagramTransport | None = None
-
+        self.lowstate = lowstate
+        self.log_subs: set[tuple[str, int]] = set()
     def connection_made(self, transport):
         self.transport = transport
 
@@ -149,7 +268,15 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
         args = msg.get("args") or {}
         print(args)
          # --------- MOVE → ObstaclesAvoid -------------------------------- #
-        if cmd_name == "oa.move":
+        if cmd_name == "log_sub":               # <— LOG‑SUBSCRIBE
+            self.log_subs.add(peer)
+            log.info("Added log subscriber %s", peer)
+            return
+        elif cmd_name == "log_unsub":           # <— LOG‑UNSUBSCRIBE
+            self.log_subs.discard(peer)
+            log.info("Removed log subscriber %s", peer)
+            return
+        elif cmd_name == "oa.move":
             vx = float(args.get("vx", 0))
             vy = float(args.get("vy", 0))
             w  = float(args.get("w" , 0))
@@ -158,6 +285,27 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
                 log.info("OA.Move  vx=%g vy=%g w=%g", vx, vy, w)
             except Exception as e:
                 log.exception("OA.Move error: %s", e)
+        elif cmd_name == "get_lowstate":
+            filter_active = True
+            # ------------- Filterliste aus args ---------------------------------- #
+            filt_raw = ["bms_state_soc", "bms_state_current", "imu_state_quaternion_", "imu_state_gyroscope_", "imu_state_accelerometer", "imu_state_rpy", "foot_force_" ]
+            if filt_raw and not isinstance(filt_raw, (list, tuple, set)):
+                log.warning("filter must be list/tuple/set – ignored")
+                filt_raw = None
+
+            include = set(map(str, filt_raw)) if filt_raw else None
+            if filter_active:
+                ls = self.lowstate.snapshot(include)   # <-- Filter anwenden
+            else:
+                ls = self.lowstate.snapshot()
+            resp = {"err": "no-lowstate"} if ls is None else {"lowstate": ls}
+
+            # kompakt zurücksenden
+            self.transport.sendto(
+                json.dumps(resp, separators=(",", ":"), ensure_ascii=False).encode(),
+                addr
+            )
+            return
         else:
             cmd = CMD_MAP.get(cmd_name)
             if not cmd:
@@ -185,7 +333,7 @@ class UDPCommandProtocol(asyncio.DatagramProtocol):
             rtt_ms = max(0, int((time.time() - ts_ns / 1e9) * 1000))
 
             echo = {"ack": msg.get("seq"), "loss": loss_pct, "rtt": rtt_ms}
-            self.transport.sendto(json.dumps(echo).encode(), addr)
+            #self.transport.sendto(json.dumps(echo).encode(), addr)
         except Exception:
             pass
 
@@ -230,30 +378,22 @@ async def main():
     sport.Init()
     log.info("SportClient initialised")
     oa = ObstaclesAvoidClient()
+    oa.SetTimeout(20.0)
     oa.Init()
     oa.SwitchSet(True)
     oa.UseRemoteCommandFromApi(True)
     log.info("ObstaclesAvoidClient initialised")
-    # state = RobotStateClient()
-    # state.Init()
-    # state.SetReportFreq(1000, 10000)
-    # code, services = state.ServiceList()
-    # if code == 0:
-    #     for svc in services:
-    #         log.info("Srv %-18s status=%d protect=%s",
-    #                 svc.name, svc.status, svc.protect)
-    # else:
-    #     log.error("ServiceList failed (%d)", code)
-    # log.info("RobotStateClient initialised")
-
+    lowstate = LowStateMonitor()
+    log.info("LowStateMonitor initialised")
+    
     loop = asyncio.get_running_loop()
     transport, proto = await loop.create_datagram_endpoint(
-        lambda: UDPCommandProtocol(sport, oa),
+        lambda: UDPCommandProtocol(sport, oa, lowstate),
         local_addr=(LISTEN_IP, port),
         reuse_port=True,
-    )
+    )       
     log.info("Listening on UDP %s:%d", LISTEN_IP, port)
-
+    log.addHandler(UDPLogHandler(proto))
     # separater Watchdog-Task
     asyncio.create_task(proto.watchdog())
 
